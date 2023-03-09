@@ -29,13 +29,14 @@ parser.add_argument('-a',
                     help='The arch (backend) to run this example on')
 args, unknowns = parser.parse_known_args()
 
-test_mode = True
+test_mode = False
 use_MacCormack = False
-use_conjugate_gradients = True
+use_conjugate_gradients = False
 use_warm_starting = True
-use_jacobi_preconditioner = True
-use_MGPCG = False
+use_jacobi_preconditioner = False
+use_MGPCG = True
 p_conjugate_gradients_iters = 200
+p_MGPCG_iters = 5
 vc_jacobi_iters = 500
 gravity = 0
 print_residual = True
@@ -53,14 +54,15 @@ maxfps = 60
 dye_decay = 1 - 1 / (maxfps * time_c)
 force_radius = res / 2.0
 debug = False
-vc_num_level = 4
+vc_num_level = 3
+top_level_num_grid = (int(res / math.pow(2, vc_num_level))) * (int(res / math.pow(2, vc_num_level)))
 
 use_sparse_matrix = False
 arch = "gpu"
 if arch in ["x64", "cpu", "arm64"]:
-    ti.init(arch=ti.cpu)
+    ti.init(arch=ti.cpu, default_fp=ti.f64)
 elif arch in ["cuda", "gpu"]:
-    ti.init(arch=ti.cuda)
+    ti.init(arch=ti.cuda, default_fp=ti.f64)
 else:
     raise ValueError('Only CPU and CUDA backends are supported for now.')
 
@@ -83,20 +85,20 @@ _dye_buffer = ti.Vector.field(3, float, shape=(res, res))
 _new_dye_buffer = ti.Vector.field(3, float, shape=(res, res))
 # A_cg = ti.field(int, shape=(res * res, 5))
 r_cg_cur = ti.field(float, shape=(res * res))
-mu_cg = ti.field(ti.f64, shape=1)
 r_cg_nxt = ti.field(float, shape=(res * res))
 p_cg_cur = ti.field(float, shape=(res * res))
 p_cg_nxt = ti.field(float, shape=(res * res))
 Ap_cg = ti.field(float, shape=(res * res))
-x_cg = ti.field(float, shape=(res * res))
+x_cg = ti.field(ti.f64, shape=(res * res))
 u_vc = ti.field(float)
 b_vc = ti.field(float)
 vc_snode = ti.root.dense(ti.i, vc_num_level + 1).dense(ti.j, res * res) # total of (vc_num_level + 1) levels
 vc_snode.place(u_vc)
 vc_snode.place(b_vc)
-u_vc_top_level = ti.field(float, shape=(res * res))
+u_vc_top_level = ti.field(float, shape=top_level_num_grid)
 r_vc = ti.field(float, shape=(res * res))
-
+rho_MGPCG = ti.field(ti.f64, shape=1)
+alpha_MGPCG = ti.field(ti.f64, shape=1)
 
 class TexPair:
     def __init__(self, cur, nxt):
@@ -350,13 +352,14 @@ def laplacian_A_mul_p(p: ti.template(), Ap: ti.template(), res: int, mul_ct: flo
 @ti.func
 def vc_laplacian_A_mul_p(p: ti.template(), Ap: ti.template(), res: int, mul_ct: float, mul_nb: float, l: int):
     # ct: center, nb: neighbor
-    for row in Ap:
+    for i, j in ti.ndrange(res, res):
+        row = i * res + j
         Ap[row] = 0.0
-        if row >= res * res:
-            continue
+        # if row >= res * res:
+        #     continue
 
-        i = row // res
-        j = row % res
+        # i = row // res
+        # j = row % res
         mul = 1.0
         if use_conjugate_gradients and use_jacobi_preconditioner:
             mul = 0.25
@@ -435,7 +438,7 @@ def pressure_conjugate_gradients_iter(pf: ti.template()):
         r_cg_pair_nxt_norm_sq += r_cg_pair.nxt[r] * r_cg_pair.nxt[r]
 
     if print_residual:
-        print(r_cg_pair_nxt_norm_sq)
+        print(ti.sqrt(r_cg_pair_nxt_norm_sq))
     # if ti.sqrt(r_cg_pair_nxt_norm_sq) < 1e-5:
     #     return
 
@@ -462,10 +465,10 @@ def calculate_vc_res(l: int):
 def damped_jacobi_smooth(l: int):
     vc_res = calculate_vc_res(l)
     vc_laplacian_A_mul_p(u_vc, Ap_cg, vc_res, 4.0, -1.0, l)
-    for i in Ap_cg:
-        if i >= vc_res * vc_res:
-            continue
-        u_vc[l, i] += 2 * one_third * (b_vc[l, i] - Ap_cg[l, i])
+    for i in ti.ndrange(vc_res * vc_res):
+        # if i >= vc_res * vc_res:
+        #     continue
+        u_vc[l, i] += 2 * one_third * (b_vc[l, i] - Ap_cg[i]) * 0.25
 
 @ti.kernel
 def v_cycle_pre():
@@ -495,17 +498,18 @@ def v_cycle_restrict(l: int):
                     mul = 1
                 b_vc[l + 1, row] += mul * r_vc[row_cur]
                 count += mul
-        b_vc[l + 1, row] /= count
+        b_vc[l + 1, row] /= (count + 1e-5)
 
 @ti.kernel
 def v_cycle_up_iter(l: int):
     vc_res = calculate_vc_res(l)
+    # print(vc_res)
     damped_jacobi_smooth(l)
     vc_laplacian_A_mul_p(u_vc, Ap_cg, vc_res, 4.0, -1.0, l)
-    for i in Ap_cg:
+    for i in ti.ndrange(vc_res * vc_res):
         r_vc[i] = 0
-        if i >= vc_res * vc_res:
-            continue
+        # if i >= vc_res * vc_res:
+        #     continue
         r_vc[i] = b_vc[l, i] - Ap_cg[i]
     v_cycle_restrict(l)
 
@@ -518,26 +522,78 @@ def v_cycle_up_iter(l: int):
 def v_cycle_solve():
     vc_res = calculate_vc_res(vc_num_level)
     for row in ti.ndrange(vc_res * vc_res):
-        ul = u_vc[vc_num_level, row + vc_res]
-        ur = u_vc[vc_num_level, row - vc_res]
-        ub = u_vc[vc_num_level, row - 1]
-        ut = u_vc[vc_num_level, row + 1]
+        u_vc_top_level[row] = u_vc[vc_num_level, row]
+    for i, j in ti.ndrange(vc_res, vc_res):
+        row = i * vc_res + j
+        ul = 0.0
+        ur = 0.0
+        ub = 0.0
+        ut = 0.0
+        if j != 0:
+            ul = u_vc_top_level[row - 1]
+        if j != vc_res - 1:
+            ur = u_vc_top_level[row + 1]
+        if i != 0:
+            ub = u_vc_top_level[row - res]
+        if i != vc_res - 1:
+            ut = u_vc_top_level[row + res]
         b_val = b_vc[vc_num_level, row]
-         = (ul + ur + ub + ut - b_val) * 0.25
+        u_vc[vc_num_level, row] = (ul + ur + ub + ut - b_val) * 0.25
 
+@ti.func
+def v_cycle_prolongate(l: int):
+    vc_res_prev = calculate_vc_res(l + 1)
+    vc_res_cur = calculate_vc_res(l)
+    for i, j in ti.ndrange(vc_res_cur, vc_res_cur):
+        row = i * vc_res_cur + j
+        h2_i = i // 2
+        h2_j = j // 2
+        # decide which four u_2h to find
+        h2_range_mul_y = 1
+        h2_range_mul_x = 1
+        if i == h2_i * 2:
+            h2_range_mul_y = -1
+        if j == h2_j * 2:
+            h2_range_mul_x = -1
+        mul = 3
+        count = 0
+        sum = 0.0
+        for m, n in ti.static(ti.ndrange((0, 2), (0, 2))):
+            i_prev = h2_i + h2_range_mul_y * m
+            j_prev = h2_j + h2_range_mul_x * n
+            row_prev = i_prev * vc_res_prev + j_prev
+            if 0 <= i_prev < vc_res_prev and 0 <= j_prev < vc_res_prev:
+                if m == 0 and n == 0:
+                    mul = 9
+                elif m == 1 and n == 1:
+                    mul = 1
+                sum += mul * u_vc[l + 1, row_prev]
+                count += mul
+        u_vc[l, row] += sum / (count + 1e-5)
+
+
+@ti.kernel
+def v_cycle_down_iter(l: int):
+    v_cycle_prolongate(l)
+    damped_jacobi_smooth(l)
+
+@ti.kernel
+def v_cycle_smooth():
+    damped_jacobi_smooth(0)
 
 def v_cycle():
     v_cycle_pre()
     for l in range(vc_num_level):
         v_cycle_up_iter(l)
     for _ in range(vc_jacobi_iters):
-
-
-
-
+        v_cycle_solve()
+    for l in range(vc_num_level - 1, -1, -1):
+        v_cycle_down_iter(l)
+    for _ in range(10):
+        v_cycle_smooth()
 
 @ti.kernel
-def pressure_MGPCG_pre(pf: ti.template()):
+def pressure_MGPCG_pre_v_cycle(pf: ti.template()):
     for i, j in pf:
         row = i * res + j
         if use_warm_starting:
@@ -547,21 +603,68 @@ def pressure_MGPCG_pre(pf: ti.template()):
             x_cg[row] = 0
 
     laplacian_A_mul_p(x_cg, Ap_cg, res, 4.0, -1.0)
-
-    mu_cg[0] = 0.0
+    # print(Ap_cg[0])
+    mu = 0.0
     for i, j in pf:
         row = i * res + j
         r_cg_pair.cur[row] = -velocity_divs[i, j]
-        if use_jacobi_preconditioner:
+        if use_conjugate_gradients and use_jacobi_preconditioner:
             r_cg_pair.cur[row] *= 0.25
         r_cg_pair.cur[row] -= Ap_cg[row]
-        mu_cg[0] += r_cg_pair.cur[row]
+        mu += r_cg_pair.cur[row] * res_sq_recip
 
-    mu_cg[0] *= res_sq_recip
+    # mu *= res_sq_recip
+    # print(mu)
     for row in r_cg_pair.cur:
-        r_cg_pair.cur[row] -= mu_cg
+        r_cg_pair.cur[row] -= mu
+        b_vc[0, row] = r_cg_pair.cur[row]
 
+@ti.kernel
+def pressure_MGPCG_post_v_cycle():
+    rho_MGPCG[0] = 0.0
+    for row in p_cg_pair.cur:
+        p_cg_pair.cur[row] = u_vc[0, row]
+        rho_MGPCG[0] += p_cg_pair.cur[row] * r_cg_pair.cur[row]
+        # r_cg_pair.cur[row] = b_vc[0, row]
 
+@ti.kernel
+def pressure_MGPCG_iter_pre_v_cycle():
+    laplacian_A_mul_p(p_cg_pair.cur, Ap_cg, res, 4.0, -1.0)
+    sigma = 0.0
+    for row in Ap_cg:
+        sigma += p_cg_pair.cur[row] * Ap_cg[row]
+    alpha_MGPCG[0] = rho_MGPCG[0] / (sigma + 1e-5)
+    mu = 0.0
+    r_norm_sq = 0.0
+    for row in r_cg_pair.cur:
+        r_cg_pair.cur[row] -= alpha_MGPCG[0] * Ap_cg[row]
+        mu += r_cg_pair.cur[row] * res_sq_recip
+        r_norm_sq += r_cg_pair.cur[row] * r_cg_pair.cur[row]
+
+    if print_residual:
+        print(ti.sqrt(r_norm_sq))
+    # mu *= res_sq_recip
+    for row in r_cg_pair.cur:
+        r_cg_pair.cur[row] -= mu
+        b_vc[0, row] = r_cg_pair.cur[row]
+
+@ti.kernel
+def pressure_MGPCG_iter_post_v_cycle():
+    rho_new = 0.0
+    for row in r_cg_pair.cur:
+        # r_cg_pair.cur[row] = b_vc[0, row]
+        rho_new += u_vc[0, row] * r_cg_pair.cur[row]
+    beta = rho_new / (rho_MGPCG[0] + 1e-5)
+    rho_MGPCG[0] = rho_new
+    for row in x_cg:
+        x_cg[row] += alpha_MGPCG[0] * p_cg_pair.cur[row]
+        p_cg_pair.cur[row] = u_vc[0, row] + beta * p_cg_pair.cur[row]
+
+@ti.kernel
+def pressure_MGPCG_post(new_pf: ti.template()):
+    for i, j in new_pf:
+        row = i * res + j
+        new_pf[i, j] = x_cg[row]
 
 def solve_pressure_sp_mat():
     copy_divergence(velocity_divs, F_b)
@@ -582,7 +685,17 @@ def solve_pressure_conjugate_gradients():
     pressures_pair.swap()
 
 def solve_pressure_MGPCG():
-    pass
+    pressure_MGPCG_pre_v_cycle(pressures_pair.cur)
+    v_cycle()
+    pressure_MGPCG_post_v_cycle()
+
+    for _ in range(p_MGPCG_iters):
+        pressure_MGPCG_iter_pre_v_cycle()
+        v_cycle()
+        pressure_MGPCG_iter_post_v_cycle()
+
+    pressure_MGPCG_post(pressures_pair.nxt)
+    pressures_pair.swap()
 
 def step(mouse_data):
     advect(velocities_pair.cur, velocities_pair.cur, velocities_pair.nxt)
