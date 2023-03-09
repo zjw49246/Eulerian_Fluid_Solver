@@ -29,17 +29,22 @@ parser.add_argument('-a',
                     help='The arch (backend) to run this example on')
 args, unknowns = parser.parse_known_args()
 
+method_jacobi = "jacobi"
+method_cg = "cg"
+method_mgpcg = "mgpcg"
+method = method_jacobi
+
 test_mode = False
 use_MacCormack = False
-use_conjugate_gradients = False
+# use_conjugate_gradients = False
 use_warm_starting = True
-use_jacobi_preconditioner = False
-use_MGPCG = True
-p_conjugate_gradients_iters = 200
+use_jacobi_preconditioner = True
+# use_MGPCG = True
+p_conjugate_gradients_iters = 20
 p_MGPCG_iters = 5
 vc_jacobi_iters = 500
 gravity = 0
-print_residual = True
+print_residual = False
 
 res = 512
 res_sq_recip = 1.0 / (res * res)
@@ -66,13 +71,11 @@ elif arch in ["cuda", "gpu"]:
 else:
     raise ValueError('Only CPU and CUDA backends are supported for now.')
 
-if use_sparse_matrix:
-    print('Using sparse matrix')
-elif use_MGPCG:
-    print('Using MGPCG')
-elif use_conjugate_gradients:
+if method == method_cg:
     print(f'Using conjugate gradients {p_conjugate_gradients_iters} iterations')
-else:
+elif method == method_mgpcg:
+    print('Using MGPCG')
+elif method == method_jacobi:
     print(f'Using jacobi iteration {p_jacobi_iters} iterations')
 
 _velocities = ti.Vector.field(2, float, shape=(res, res))
@@ -337,7 +340,7 @@ def laplacian_A_mul_p(p: ti.template(), Ap: ti.template(), res: int, mul_ct: flo
         j = row % res
         Ap[row] = 0.0
         mul = 1.0
-        if use_conjugate_gradients and use_jacobi_preconditioner:
+        if method == method_cg and use_jacobi_preconditioner:
             mul = 0.25
         Ap[row] += mul * mul_ct * p[row]
         if j != 0:
@@ -361,7 +364,7 @@ def vc_laplacian_A_mul_p(p: ti.template(), Ap: ti.template(), res: int, mul_ct: 
         # i = row // res
         # j = row % res
         mul = 1.0
-        if use_conjugate_gradients and use_jacobi_preconditioner:
+        if method == method_cg and use_jacobi_preconditioner:
             mul = 0.25
         Ap[row] += mul * mul_ct * p[l, row]
         if j != 0:
@@ -608,7 +611,7 @@ def pressure_MGPCG_pre_v_cycle(pf: ti.template()):
     for i, j in pf:
         row = i * res + j
         r_cg_pair.cur[row] = -velocity_divs[i, j]
-        if use_conjugate_gradients and use_jacobi_preconditioner:
+        if method == method_cg and use_jacobi_preconditioner:
             r_cg_pair.cur[row] *= 0.25
         r_cg_pair.cur[row] -= Ap_cg[row]
         mu += r_cg_pair.cur[row] * res_sq_recip
@@ -711,11 +714,11 @@ def step(mouse_data):
         vorticity(velocities_pair.cur)
         enhance_vorticity(velocities_pair.cur, velocity_curls)
 
-    if use_MGPCG:
+    if method == method_mgpcg:
         solve_pressure_MGPCG()
-    elif use_conjugate_gradients:
+    elif method == method_cg:
         solve_pressure_conjugate_gradients()
-    else:
+    elif method == method_jacobi:
         solve_pressure_jacobi()
 
     subtract_gradient(velocities_pair.cur, pressures_pair.cur)
@@ -782,9 +785,32 @@ def reset():
     pressures_pair.cur.fill(0)
     dyes_pair.cur.fill(0)
 
+def change_iters_num(iter_method, increase=True):
+    global p_jacobi_iters, p_conjugate_gradients_iters, p_MGPCG_iters
+    mul = 1
+    if not increase:
+        mul = -1
+    if iter_method == method_jacobi:
+        p_jacobi_iters += 10 * mul
+        if p_jacobi_iters < 10:
+            p_jacobi_iters = 10
+        elif p_jacobi_iters > 1000:
+            p_jacobi_iters = 1000
+    elif iter_method == method_cg:
+        p_conjugate_gradients_iters += 1 * mul
+        if p_conjugate_gradients_iters < 1:
+            p_conjugate_gradients_iters = 1
+        elif p_conjugate_gradients_iters > 300:
+            p_conjugate_gradients_iters = 300
+    elif iter_method == method_mgpcg:
+        p_MGPCG_iters += 1 * mul
+        if p_MGPCG_iters < 1:
+            p_MGPCG_iters = 1
+        elif p_MGPCG_iters > 50:
+            p_MGPCG_iters = 50
 
 def main():
-    global debug, curl_strength
+    global debug, curl_strength, method, test_mode, num_iters_label
     visualize_d = True  #visualize dye (default)
     visualize_v = False  #visualize velocity
     visualize_c = False  #visualize curl
@@ -794,7 +820,28 @@ def main():
     gui = ti.GUI('Stable Fluid', (res, res))
     md_gen = MouseDataGen(test_mode)
 
+    method_jacobi_button = gui.button('1.Jacobi')
+    method_cg_button = gui.button('2.CG')
+    method_mgpcg_button = gui.button('3.MGPCG')
+    # num_iters_min = 10
+    # num_iters_max = 1000
+    # num_iters_step = 10
+    test_mode_button = gui.button('example On/Off')
+    method_label = gui.label('iteration method')
+    num_iters_label = gui.label('iteration num')
+
+
     while gui.running:
+        if method == method_jacobi:
+            method_label.value = 1
+            num_iters_label.value = p_jacobi_iters
+        elif method == method_cg:
+            method_label.value = 2
+            num_iters_label.value = p_conjugate_gradients_iters
+        elif method == method_mgpcg:
+            method_label.value = 3
+            num_iters_label.value = p_MGPCG_iters
+
         if gui.get_event(ti.GUI.PRESS):
             e = gui.event
             if e.key == ti.GUI.ESCAPE:
@@ -823,6 +870,27 @@ def main():
                 paused = not paused
             elif e.key == 'd':
                 debug = not debug
+            elif e.key == method_jacobi_button:
+                # reset()
+                method = method_jacobi
+                num_iters_label.value = p_jacobi_iters
+            elif e.key == method_cg_button:
+                # reset()
+                method = method_cg
+                num_iters_label.value = p_conjugate_gradients_iters
+            elif e.key == method_mgpcg_button:
+                # reset()
+                method = method_mgpcg
+                num_iters_label.value = p_MGPCG_iters
+            elif e.key == test_mode_button:
+                reset()
+                test_mode = not test_mode
+                md_gen = MouseDataGen(test_mode)
+            elif e.key == gui.UP:
+                change_iters_num(method, True)
+            elif e.key == gui.DOWN:
+                change_iters_num(method, False)
+
 
         # Debug divergence:
         # print(max((abs(velocity_divs.to_numpy().reshape(-1)))))
