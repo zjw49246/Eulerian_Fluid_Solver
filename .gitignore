@@ -1,2 +1,6 @@
 stable_fluid_MGPCG.py
 .idea/
+frames/
+*.mp4
+results_*/
+!results/results_*/
