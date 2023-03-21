@@ -3,6 +3,8 @@ This project extends Eulerian fluid solver in [taichi's stable fluid example](ht
 
 The extention includes MacCormack advection, conjugate gradients iteration with Jacobi preconditioner and multigrid preconditioner (MGPCG).
 
+The implementation of MGPCG is based on [A Parallel Multigrid Poisson Solver for Fluids Simulation on Large Grids](https://www.math.ucla.edu/~jteran/papers/MST10.pdf).
+
 ## Usage
 Create a Python virtual environment and install taichi
 ```angular2html
